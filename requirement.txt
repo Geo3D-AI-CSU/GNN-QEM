@@ -1,0 +1,55 @@
+# ===============================
+# Python version (recommended)
+# ===============================
+# Python 3.10
+
+# ===============================
+# PyTorch (CUDA 12.1)
+# ===============================
+--index-url https://download.pytorch.org/whl/cu121
+
+torch==2.4.0
+torchvision==0.19.0
+torchaudio==2.4.0
+
+# ===============================
+# Core Dependencies
+# ===============================
+torch_geometric==2.5.3
+
+numpy==1.26.4
+scipy>=1.10.0
+
+trimesh==4.4.0
+tqdm==4.66.5
+
+# ===============================
+# Visualization / Logging
+# ===============================
+tensorboard>=2.14.0
+
+# ===============================
+# PyTorch Geometric dependencies
+# (IMPORTANT: install automatically via pip, but listed for clarity)
+# ===============================
+torch-scatter
+torch-sparse
+torch-cluster
+torch-spline-conv
+
+# ===============================
+# Standard library extensions (used in your code)
+# ===============================
+# (These are usually built-in, listed for completeness)
+# argparse
+# dataclasses
+# typing
+# json
+# datetime
+# heapq
+# os
+
+# ===============================
+# Optional (recommended for stability)
+# ===============================
+networkx>=3.0
