@@ -7,6 +7,7 @@ from torch_geometric.nn import GCNConv
 
 class EdgeImportanceGNN(nn.Module):
     """
+    改进点：
       1) 支持 multi-scale message passing：local edge_index + far edge_index_far
       2) 输入维度可变（mesh_dataset.py 已把 PE 拼进 x）
       3) edge_mlp 使用：h_src, h_dst, |h_src-h_dst| + 几何边特征（dihedral/len）

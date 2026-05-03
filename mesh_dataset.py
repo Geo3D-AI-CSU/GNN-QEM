@@ -9,7 +9,13 @@ import trimesh
 
 
 class MeshGraphData(Data):
+    """
+    自定义 Data：修复 PyG batching 时自定义张量的 index 偏移规则。
 
+    关键修复：
+      - dir2undir: 需要按 E_undir 累加，否则 batch_size>1 会错位
+      - undirected_edges / faces / edge_index_far: 顶点索引，需要按 num_nodes 累加
+    """
 
     def __inc__(self, key, value, *args, **kwargs):
         if key == "dir2undir":
@@ -366,10 +372,15 @@ def mesh_to_graph(
 
     # === 5. 顶点特征 x ===
     if num_vertices > 0:
+        # 移除了 vertices，仅保留法向、度数和边界标志
         base = np.concatenate(
-            [vertices, vertex_normals, valence_norm[:, None], vertex_is_boundary[:, None]],
+            [vertex_normals, valence_norm[:, None], vertex_is_boundary[:, None]],
             axis=1,
         ).astype(np.float32)
+        # base = np.concatenate(
+        #     [vertices, vertex_normals, valence_norm[:, None], vertex_is_boundary[:, None]],
+        #     axis=1,
+        # ).astype(np.float32)
         x_np = np.concatenate([base, pe.astype(np.float32)], axis=1) if pe_dim > 0 else base
     else:
         x_np = np.zeros((0, 8 + max(pe_dim, 0)), dtype=np.float32)

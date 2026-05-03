@@ -2,6 +2,8 @@
 import os
 import json
 import datetime
+import time  # 用于计算训练耗时
+import csv   # 用于导出 CSV 数据
 from dataclasses import dataclass, asdict
 from typing import Optional
 
@@ -15,14 +17,14 @@ from torch.utils.tensorboard import SummaryWriter
 from mesh_dataset import MeshDataset, MeshGraphData
 from models import EdgeImportanceGNN
 
+# ==== ✅ 版本标记：对齐论文 3.4 节的纯净 Loss 版 ====
+TRAINER_VERSION = "EdgeImportanceGNN-train-v7-PaperAlignedLosses"
+
+
 def edge_contrastive_loss(h, edge_index, num_neg: int = 1) -> torch.Tensor:
     """
-    简单对比损失（无监督）：
-      - 正样本：真实边 (i, j)
-      - 负样本：随机点对 (i, k)，尽量让两者 embedding 不相似
-
-    h:          (N, H) 顶点 embedding
-    edge_index: (2, E) 图边
+    论文 3.4.1: Structural Contrastive Loss (L_struct)
+    鼓励相邻节点 embedding 相似，非相邻节点正交。
     """
     src, dst = edge_index
     pos_h_src = h[src]
@@ -49,18 +51,24 @@ def edge_contrastive_loss(h, edge_index, num_neg: int = 1) -> torch.Tensor:
     return pos_loss + neg_loss
 
 
-def edge_importance_regularization(
+def feature_hinge_loss(
     importance: torch.Tensor,
-    edge_index: torch.Tensor,
-    h: torch.Tensor,
+    target_dir: torch.Tensor,
+    edge_is_boundary_dir: torch.Tensor,
+    min_imp: float = 0.60,
+    dihedral_feat_thresh: float = 0.70,
 ) -> torch.Tensor:
     """
-    让 high-importance 边对应的 embedding 差异更大（弱正则）。
-    diff.detach() 防止训练朝“瞎拉开 embedding”崩掉。
+    论文 3.4.2 (公式12): Hinge Loss (L_geo 的一部分)
+    对高二面角或边界的 sharp 边，重要性不能低于 min_imp (0.6)
     """
-    src, dst = edge_index
-    diff = (h[src] - h[dst]).pow(2).sum(dim=-1).sqrt()
-    return - (importance * diff.detach()).mean()
+    with torch.no_grad():
+        feat_mask = (edge_is_boundary_dir > 0.5) | (target_dir >= dihedral_feat_thresh)
+
+    if int(feat_mask.sum().item()) == 0:
+        return importance.new_tensor(0.0)
+
+    return F.relu(min_imp - importance[feat_mask]).mean()
 
 
 def sharpness_ranking_loss(
@@ -72,10 +80,8 @@ def sharpness_ranking_loss(
     max_pairs: int = 4096,
 ) -> torch.Tensor:
     """
-    基于几何锐度（edge_feature_weight）构造 ranking loss（弱先验）：
-      high: target_dir >= high_thresh
-      low : target_dir <= low_thresh
-      L_rank = mean( relu(margin - (imp_high - imp_low)) )
+    论文 3.4.2 (公式13): Pairwise Ranking Loss (L_geo 的一部分)
+    使 sharp 边和 flat 边的重要性拉开 margin (0.1) 的差距
     """
     with torch.no_grad():
         pos_idx = (target_dir >= high_thresh).nonzero(as_tuple=True)[0]
@@ -95,26 +101,6 @@ def sharpness_ranking_loss(
     return F.relu(margin - diff).mean()
 
 
-def feature_hinge_loss(
-    importance: torch.Tensor,
-    target_dir: torch.Tensor,
-    edge_is_boundary_dir: torch.Tensor,
-    min_imp: float = 0.60,
-    dihedral_feat_thresh: float = 0.70,
-) -> torch.Tensor:
-    """
-    只在“边界边 or 高二面角边”上约束 importance 不要太低：
-      L_hinge = mean( relu(min_imp - imp[e]) ) for e in feature_edges
-    """
-    with torch.no_grad():
-        feat_mask = (edge_is_boundary_dir > 0.5) | (target_dir >= dihedral_feat_thresh)
-
-    if int(feat_mask.sum().item()) == 0:
-        return importance.new_tensor(0.0)
-
-    return F.relu(min_imp - importance[feat_mask]).mean()
-
-
 def smoothness_loss_incident(
     importance: torch.Tensor,
     edge_index: torch.Tensor,
@@ -122,11 +108,8 @@ def smoothness_loss_incident(
     use_abs: bool = True,
 ) -> torch.Tensor:
     """
-    ✅ O(E) 的平滑正则（训练稳，避免 importance 乱跳导致折叠乱三角）：
-    同一顶点的 incident edges importance 应该相对一致
-
-      - 先按 src 聚合每个顶点的 mean importance
-      - 再让每条边的 importance 接近 (mean[src] + mean[dst]) / 2
+    论文 3.4.3: Local Smoothness Regularization (L_smooth)
+    使共享同一顶点的邻接边具有相似的重要性分数
     """
     src, dst = edge_index
     ones = torch.ones_like(importance)
@@ -148,22 +131,9 @@ def smoothness_loss_incident(
     return diff.abs().mean() if use_abs else (diff * diff).mean()
 
 
-def importance_entropy_regularization(importance: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """
-    ✅ 替代旧的 (mean-0.35)^2：形状无关、更稳健的分布正则
-    - 目标：避免 importance 塌缩为全 0/全 1
-    - 做法：最大化 Bernoulli entropy（训练里以 loss 形式加入：loss += w * (-entropy)）
-
-    返回：loss_entropy = -H(p) （越小越好）
-    """
-    p = importance.clamp(eps, 1.0 - eps)
-    ent = - (p * torch.log(p) + (1.0 - p) * torch.log(1.0 - p)).mean()
-    return -ent
-
-
 def _safe_np_colorize(values_01, cmap_name: str = "jet"):
     """
-    把 [0,1] 映射到 RGB(0-255)。优先用 matplotlib；没有则用简易渐变。
+    把 [0,1] 映射到 RGB(0-255)。
     """
     v = values_01.astype("float32")
     v = v.clip(0.0, 1.0)
@@ -174,7 +144,6 @@ def _safe_np_colorize(values_01, cmap_name: str = "jet"):
         c = cmap(v)[:, :3]
         return (c * 255.0).astype("uint8")
     except Exception:
-        # fallback: blue->red
         r = v
         g = 1.0 - (v - 0.5).clip(0, 0.5) * 2.0
         b = 1.0 - v
@@ -194,8 +163,7 @@ def save_importance_map_from_graph(
     cmap: str = "jet",
 ) -> None:
     """
-    将无向边 importance 映射到顶点颜色，并导出带 vertex_colors 的 PLY（或 OBJ，但 PLY 更稳定）。
-    data.x 必须前 3 维是 xyz；data.faces 为三角面；data.undirected_edges 对齐 importance_undir。
+    将无向边 importance 映射到顶点颜色，并导出带 vertex_colors 的 PLY。
     """
     import numpy as np
     import trimesh
@@ -228,12 +196,11 @@ def save_importance_map_from_graph(
 
 @dataclass
 class LossWeights:
-    contrast: float = 1.0
-    hinge: float = 0.7
-    smooth: float = 0.2
-    rank: float = 0.25
-    imp_entropy: float = 0.03   # ✅ 新：分布正则（越大越避免塌缩，但也更“均匀”）
-    feat_reg: float = 0.02
+    """✅ 严格对齐论文公式 (15) 的各项权重"""
+    contrast: float = 1.0   # L_struct 权重
+    hinge: float = 0.7      # L_geo (绝对阈值) 权重
+    rank: float = 0.25      # L_geo (相对排序) 权重
+    smooth: float = 0.2     # L_smooth 权重
 
 
 def train(
@@ -246,12 +213,12 @@ def train(
     ckpt_path: str = "checkpoints/edge_gnn_tosc.pt",
     bidirectional_graph: bool = True,
 
-    # dataset / graph settings（对齐 mesh_dataset.py）
+    # dataset / graph settings
     pe_dim: int = 16,
     use_far_graph: bool = True,
     max_far_neighbors: int = 12,
 
-    # model multiscale settings（对齐 models.py）
+    # model multiscale settings
     use_multiscale: bool = True,
     far_scale: float = 0.5,
     dropout: float = 0.15,
@@ -275,12 +242,8 @@ def train(
     vis_index: int = 0,
     vis_dir: str = "logs/vis",
     loss_w: LossWeights = LossWeights(),
+    csv_out: Optional[str] = None,
 ):
-    """
-    训练 EdgeImportanceGNN（弱先验 + 结构无监督 + ranking）并加入可视化监控：
-      1) TensorBoard：Loss 曲线、importance 分布、grad norm、学习率等
-      2) Importance 热力图导出：每 N 个 epoch 导出一次带颜色的 PLY 便于 MeshLab 观察
-    """
     dataset = MeshDataset(
         root=root,
         mesh_dir=mesh_dir,
@@ -317,7 +280,6 @@ def train(
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
 
-    # --- TensorBoard writer ---
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     if run_name is None:
         run_name = f"{ts}_pe{pe_dim}_far{int(use_far_graph)}_k{max_far_neighbors}_bi{int(bidirectional_graph)}"
@@ -325,7 +287,6 @@ def train(
     log_dir = os.path.join(log_root, run_name)
     writer = SummaryWriter(log_dir=log_dir, flush_secs=int(tb_flush_secs))
 
-    # dump config
     cfg = dict(
         version=TRAINER_VERSION,
         root=root,
@@ -356,10 +317,12 @@ def train(
 
     print(f"[Trainer] Version: {TRAINER_VERSION}")
     print(f"[Trainer] Device: {device} | pin_memory={pin_memory} | num_workers={num_workers}")
-    print(f"[Trainer] InChannels={in_channels}")
-    print(f"[Trainer] DatasetCache: {dataset.processed_paths[0]}")
     print(f"[Trainer] TensorBoard log_dir: {log_dir}")
     print(f"[Trainer] LossWeights: {loss_w}")
+
+    if torch.cuda.is_available() and "cuda" in str(device):
+        torch.cuda.reset_peak_memory_stats(device)
+    start_time = time.time()
 
     global_step = 0
 
@@ -373,7 +336,6 @@ def train(
             data = data.to(device)
             optimizer.zero_grad(set_to_none=True)
 
-            # --- Ablation：处理 edge_feature_weight（影响模型 edge_attr）---
             if hasattr(data, "edge_feature_weight"):
                 if no_dihedral_feat:
                     data.edge_feature_weight = torch.zeros_like(data.edge_feature_weight)
@@ -386,12 +348,10 @@ def train(
             importance = out["edge_importance_dir"]
             h = out["vertex_embeddings"]
 
+            # 1. Structural Contrastive Loss
             contrast_loss = edge_contrastive_loss(h, data.edge_index)
 
-            # ✅ 新：entropy reg（替代 mean-0.35 先验）
-            ent_reg = importance_entropy_regularization(importance)
-
-            # weak prior：hinge + rank
+            # 2. Geometry-Aware Loss (Hinge & Rank)
             if hasattr(data, "edge_feature_weight") and hasattr(data, "dir2undir"):
                 feat_undir = data.edge_feature_weight.to(device)
                 dir2undir = data.dir2undir.to(device)
@@ -423,6 +383,7 @@ def train(
                 hinge_loss = torch.tensor(0.0, device=device)
                 rank_loss = torch.tensor(0.0, device=device)
 
+            # 3. Local Smoothness Regularization
             smooth_loss = smoothness_loss_incident(
                 importance=importance,
                 edge_index=data.edge_index,
@@ -430,15 +391,12 @@ def train(
                 use_abs=True,
             )
 
-            feat_reg = edge_importance_regularization(importance, data.edge_index, h)
-
+            # ==== 纯净版 Total Loss ====
             loss = (
                 loss_w.contrast * contrast_loss
                 + loss_w.hinge * hinge_loss
-                + loss_w.smooth * smooth_loss
                 + loss_w.rank * rank_loss
-                + loss_w.imp_entropy * ent_reg
-                + loss_w.feat_reg * feat_reg
+                + loss_w.smooth * smooth_loss
             )
 
             loss.backward()
@@ -448,7 +406,6 @@ def train(
             total_loss += float(loss.item())
             global_step += 1
 
-            # --- per-step logging（可选：这里控制频率）---
             if global_step % 20 == 0:
                 with torch.no_grad():
                     imp_mean = float(importance.mean().item())
@@ -462,28 +419,23 @@ def train(
                 loss=float(loss.item()),
                 contrast=float(contrast_loss.item()),
                 hinge=float(hinge_loss.item()),
-                smooth=float(smooth_loss.item()),
                 rank=float(rank_loss.item()),
-                ent_reg=float(ent_reg.item()),
+                smooth=float(smooth_loss.item()),
                 grad_norm=grad_norm,
             )
 
         avg_loss = total_loss / max(1, len(loader))
 
-        # --- epoch logging ---
         writer.add_scalar("Loss/Total", avg_loss, epoch)
         writer.add_scalar("Loss/Contrastive", last_items.get("contrast", 0.0), epoch)
         writer.add_scalar("Loss/Hinge", last_items.get("hinge", 0.0), epoch)
-        writer.add_scalar("Loss/Smooth", last_items.get("smooth", 0.0), epoch)
         writer.add_scalar("Loss/Rank", last_items.get("rank", 0.0), epoch)
-        writer.add_scalar("Loss/EntropyReg", last_items.get("ent_reg", 0.0), epoch)
+        writer.add_scalar("Loss/Smooth", last_items.get("smooth", 0.0), epoch)
         writer.add_scalar("Train/GradNorm", last_items.get("grad_norm", 0.0), epoch)
         writer.add_scalar("Train/LR", float(optimizer.param_groups[0]["lr"]), epoch)
 
-        # importance distribution histogram (pick last batch stats if possible)
         try:
             with torch.no_grad():
-                # 用 dataset[vis_index] 重新推一遍，避免 batch 合并的影响
                 sample = dataset[int(max(0, min(vis_index, len(dataset)-1)))]
                 sample = sample.to(device)
                 out_u = model(sample, return_vertex_embeddings=False, aggregate_undirected=True)
@@ -497,15 +449,11 @@ def train(
         print(
             f"[Epoch {epoch}] avg_loss={avg_loss:.4f} | "
             f"contrast={last_items.get('contrast', 0):.4f} hinge={last_items.get('hinge', 0):.4f} "
-            f"smooth={last_items.get('smooth', 0):.4f} rank={last_items.get('rank', 0):.4f} "
-            f"ent_reg={last_items.get('ent_reg', 0):.4f}"
+            f"rank={last_items.get('rank', 0):.4f} smooth={last_items.get('smooth', 0):.4f}"
         )
 
-        # --- checkpoint ---
         torch.save(model.state_dict(), ckpt_path)
-        print(f"Checkpoint saved to {ckpt_path}")
 
-        # --- visualization: export PLY ---
         if vis_every > 0 and (epoch % int(vis_every) == 0):
             try:
                 os.makedirs(vis_dir, exist_ok=True)
@@ -515,13 +463,31 @@ def train(
                 with torch.no_grad():
                     out_u = model(sample, return_vertex_embeddings=False, aggregate_undirected=True)
                     imp_undir = out_u["edge_importance_undir"]
-                # 保存路径：包含 epoch
                 out_ply = os.path.join(vis_dir, f"importance_epoch{epoch:03d}.ply")
                 save_importance_map_from_graph(sample, imp_undir, out_ply, cmap="jet")
-                print(f"[Vis] importance heatmap exported: {out_ply}")
                 writer.add_text("Vis/Latest", out_ply, epoch)
-            except Exception as e:
-                print(f"[Vis] export failed: {e}")
+            except Exception:
+                pass
+
+    end_time = time.time()
+    total_time_s = end_time - start_time
+    peak_vram_mb = 0.0
+    if torch.cuda.is_available() and "cuda" in str(device):
+        peak_vram_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+
+    print("\n" + "="*50)
+    print(f"📊 [Metrics] 训练总耗时: {total_time_s:.2f} 秒")
+    print(f"📊 [Metrics] 显存峰值占用: {peak_vram_mb:.2f} MB")
+    print("="*50 + "\n")
+
+    if csv_out:
+        os.makedirs(os.path.dirname(csv_out) or ".", exist_ok=True)
+        file_exists = os.path.isfile(csv_out)
+        with open(csv_out, mode='a', newline='', encoding='utf-8-sig') as f:
+            csv_writer = csv.writer(f)
+            if not file_exists:
+                csv_writer.writerow(["run_name", "epochs", "device", "total_time_s", "peak_vram_mb"])
+            csv_writer.writerow([run_name, epochs, device, f"{total_time_s:.2f}", f"{peak_vram_mb:.2f}"])
 
     writer.close()
 
@@ -538,34 +504,29 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--ckpt", type=str, default="checkpoints/edge_gnn_tosc.pt")
 
-    # graph
     parser.add_argument("--bidirectional_graph", type=int, default=1)
     parser.add_argument("--pe_dim", type=int, default=16)
     parser.add_argument("--use_far_graph", type=int, default=1)
     parser.add_argument("--max_far_neighbors", type=int, default=12)
 
-    # model
     parser.add_argument("--use_multiscale", type=int, default=1)
     parser.add_argument("--far_scale", type=float, default=0.5)
     parser.add_argument("--dropout", type=float, default=0.15)
 
-    # ablation
     parser.add_argument("--no_dihedral_feat", type=int, default=0)
     parser.add_argument("--shuffle_dihedral_feat", type=int, default=0)
 
-    # weak-prior hyper
     parser.add_argument("--dihedral_feat_thresh", type=float, default=0.70)
     parser.add_argument("--hinge_min_imp", type=float, default=0.60)
 
-    # perf
     parser.add_argument("--num_workers", type=int, default=-1)
 
-    # monitoring
     parser.add_argument("--log_root", type=str, default="logs/train")
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--vis_every", type=int, default=5)
     parser.add_argument("--vis_index", type=int, default=0)
     parser.add_argument("--vis_dir", type=str, default="logs/vis")
+    parser.add_argument("--csv_out", type=str, default=None)
 
     args = parser.parse_args()
     nw = None if args.num_workers < 0 else int(args.num_workers)
@@ -579,26 +540,21 @@ if __name__ == "__main__":
         device=args.device,
         ckpt_path=args.ckpt,
         bidirectional_graph=bool(args.bidirectional_graph),
-
         pe_dim=args.pe_dim,
         use_far_graph=bool(args.use_far_graph),
         max_far_neighbors=args.max_far_neighbors,
-
         use_multiscale=bool(args.use_multiscale),
         far_scale=args.far_scale,
         dropout=args.dropout,
-
         no_dihedral_feat=bool(args.no_dihedral_feat),
         shuffle_dihedral_feat=bool(args.shuffle_dihedral_feat),
-
         dihedral_feat_thresh=args.dihedral_feat_thresh,
         hinge_min_imp=args.hinge_min_imp,
-
         num_workers=nw,
-
         log_root=args.log_root,
         run_name=args.run_name,
         vis_every=args.vis_every,
         vis_index=args.vis_index,
         vis_dir=args.vis_dir,
+        csv_out=args.csv_out,
     )
