@@ -17,7 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 from mesh_dataset import MeshDataset, MeshGraphData
 from models import EdgeImportanceGNN
 
-# ==== ✅ 版本标记：对齐论文 3.4 节的纯净 Loss 版 ====
+# ==== 版本标记：对齐论文 3.4 节的纯净 Loss 版 ====
 TRAINER_VERSION = "EdgeImportanceGNN-train-v7-PaperAlignedLosses"
 
 
@@ -196,7 +196,7 @@ def save_importance_map_from_graph(
 
 @dataclass
 class LossWeights:
-    """✅ 严格对齐论文公式 (15) 的各项权重"""
+    """严格对齐论文公式 (15) 的各项权重"""
     contrast: float = 1.0   # L_struct 权重
     hinge: float = 0.7      # L_geo (绝对阈值) 权重
     rank: float = 0.25      # L_geo (相对排序) 权重

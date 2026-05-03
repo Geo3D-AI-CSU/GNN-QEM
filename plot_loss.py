@@ -14,7 +14,7 @@ def plot_tensorboard_log(log_dir, save_path="loss_curve.png"):
 
     # 容错：如果文件夹路径写错了，或者里面没有日志文件
     if log_file is None:
-        print(f"❌ 错误：在 '{log_dir}' 目录下没有找到 TensorBoard 日志文件！请检查路径。")
+        print(f"错误：在 '{log_dir}' 目录下没有找到 TensorBoard 日志文件！请检查路径。")
         return
 
     # 加载日志
@@ -43,9 +43,9 @@ def plot_tensorboard_log(log_dir, save_path="loss_curve.png"):
 
         # 保存 600 DPI 高清图
         plt.savefig(save_path, dpi=600, bbox_inches='tight')
-        print(f"✅ 600 DPI 的高清 Loss 曲线已保存到: {save_path}")
+        print(f"600 DPI 的高清 Loss 曲线已保存到: {save_path}")
     else:
-        print("❌ 错误：日志文件中没有找到 'Loss/Total' 数据！")
+        print("错误：日志文件中没有找到 'Loss/Total' 数据！")
 
 
 # ==========================================

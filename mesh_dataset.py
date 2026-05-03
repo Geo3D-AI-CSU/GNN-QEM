@@ -137,8 +137,8 @@ def _compute_laplacian_pe(
     说明：
       - 优先使用 scipy.sparse.linalg.eigsh（更快更省内存）
       - 若 scipy 不可用或求解失败：小图(N<=4000)走 dense eigh，否则返回 0
-      - ✅ 增加 sign canonicalization，避免 ±v 翻转导致训练不稳定
-      - ✅ 提供确定性的 v0（seed），减少 ARPACK 的随机性
+      - 增加 sign canonicalization，避免 ±v 翻转导致训练不稳定
+      - 提供确定性的 v0（seed），减少 ARPACK 的随机性
     """
     if pe_dim <= 0 or num_vertices <= 0:
         return np.zeros((num_vertices, 0), dtype=np.float32)
@@ -427,7 +427,7 @@ class MeshDataset(InMemoryDataset):
 
     @property
     def processed_file_names(self) -> List[str]:
-        # ✅ 必修：把关键参数写进文件名，防止加载旧缓存导致“你以为改了，其实没生效”
+        # 把关键参数写进文件名，防止加载旧缓存导致“你以为改了，其实没生效”
         name = (
             f"mesh_graph_pe{self.pe_dim}"
             f"_far{int(self.use_far_graph)}"
@@ -456,7 +456,7 @@ class MeshDataset(InMemoryDataset):
                 continue
             path = os.path.join(self.mesh_dir, fname)
 
-            # ✅ 对齐推理：process=False（避免 Trimesh 自动“修复”破坏索引一致性）
+            # 对齐推理：process=False（避免 Trimesh 自动“修复”破坏索引一致性）
             mesh = trimesh.load(path, force="mesh", process=False)
             if not isinstance(mesh, trimesh.Trimesh):
                 mesh = mesh.dump(concatenate=True)
